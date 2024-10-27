@@ -12,13 +12,13 @@ time_step = 1e2  # Pas de temps en secondes
 epsilon = 1e8  # Pour éviter les divisions par zéro
 expansion_rate = 1.0001  # Facteur d'expansion par étape
 
-# Demander à l'utilisateur le nombre de simulations et d'étapes
+# Demander à l'utilisateur le nombre de simulations, d'étapes et de particules
 try:
     num_simulations = int(input("Entrez le nombre de simulations à exécuter : "))
     num_steps = int(input("Entrez le nombre d'étapes par simulation : "))
     num_particles = int(input("Entrez le nombre de particules que vous souhaitez générer : "))
 except ValueError:
-    print("Veuillez entrer des nombres entiers valides pour le nombre de simulations et d'étapes.")
+    print("Veuillez entrer des nombres entiers valides pour les paramètres.")
     sys.exit(1)
 
 # Créer un répertoire pour les images de simulation
@@ -26,6 +26,9 @@ os.makedirs("simulations_output", exist_ok=True)
 
 # Initialisation d'un drapeau d'arrêt partagé entre processus
 stop_flag = Value('b', False)
+
+# Nombre maximum de processus simultanés
+max_processes = 5
 
 # Fonction pour gérer l'interruption par l'utilisateur
 def signal_handler(sig, frame):
@@ -35,12 +38,12 @@ def signal_handler(sig, frame):
 # Enregistrer le gestionnaire de signal
 signal.signal(signal.SIGINT, signal_handler)
 
-# Fonction pour calculer la force gravitationnelle (attractive uniquement)
+# Fonction pour calculer la force gravitationnelle avec le modèle Janus
 def gravitational_force(pos1, pos2, m1, m2):
     distance = np.linalg.norm(pos1 - pos2) + epsilon
-    force_magnitude = G * m1 * m2 / distance**2
+    force_magnitude = G * np.abs(m1 * m2) / distance**2
     direction = (pos2 - pos1) / distance
-    return force_magnitude * direction
+    return force_magnitude * direction if m1 * m2 > 0 else -force_magnitude * direction
 
 # Fonction pour exécuter une seule simulation
 def run_simulation(sim_num, queue, stop_flag):
@@ -50,7 +53,7 @@ def run_simulation(sim_num, queue, stop_flag):
     np.random.seed(sim_num)
     positions = np.random.randn(num_particles, 2) * 1e18
     velocities = np.random.randn(num_particles, 2) * 1e3
-    masses = np.abs(np.random.randn(num_particles)) * 1e30
+    masses = np.random.randn(num_particles) * 1e30  # Masses positives et négatives pour le modèle Janus
     
     # Rotation initiale pour simuler un disque galactique
     center = np.mean(positions, axis=0)
@@ -77,17 +80,18 @@ def run_simulation(sim_num, queue, stop_flag):
         # Mise à jour des vitesses et positions
         velocities += forces / masses[:, np.newaxis] * time_step
         positions += velocities * time_step
-        positions *= expansion_rate
+        positions *= expansion_rate  # Expansion de l'univers
 
         # Envoi de la progression à la file
         queue.put((sim_num, step + 1, num_steps, time.time() - start_time))
     
     # Sauvegarder le rendu final de la simulation
     plt.figure(figsize=(8, 8))
-    plt.scatter(positions[:, 0], positions[:, 1], s=1, c='blue')
+    colors = ['blue' if m < 0 else 'red' for m in masses]  # Bleu pour masses négatives, rouge pour positives
+    plt.scatter(positions[:, 0], positions[:, 1], s=1, c=colors)
     plt.xlim(-5e18, 5e18)
     plt.ylim(-5e18, 5e18)
-    plt.title(f"Simulation {sim_num} | Dernière étape")
+    plt.title(f"Simulation Model Janus {sim_num} | Dernière étape")
     plt.savefig(f"simulations_output/Simulation_N_{sim_num}.jpg", format='jpg')
     plt.close()
     
@@ -113,18 +117,15 @@ def display_progress(queue, num_simulations):
                 if sim_num in progress:
                     del progress[sim_num]
         
-        # Affichage de la progression
-        progress_text = "\033c"  # Code pour effacer l'écran (compatible sur de nombreux terminaux)
-        progress_text += "=== Progression des simulations ===\n"
+        # Effacer l'écran et afficher la progression sans accumulation
+        print("\033c", end="")  # Code pour effacer l'écran
+        print("=== Progression des simulations ===")
         for sim_num, (step, num_steps, elapsed_time) in progress.items():
             avg_time_per_step = elapsed_time / step
             time_remaining = avg_time_per_step * (num_steps - step)
-            progress_text += (
-                f"Simulation {sim_num}/{num_simulations} | Étape {step}/{num_steps} "
-                f"| Temps écoulé : {elapsed_time:.2f}s | Temps restant estimé : {time_remaining:.2f}s\n"
-            )
+            print(f"Simulation {sim_num}/{num_simulations} | Étape {step}/{num_steps} "
+                  f"| Temps écoulé : {elapsed_time:.2f}s | Temps restant estimé : {time_remaining:.2f}s")
         
-        print(progress_text, end="\r")  # Affichage continu de la progression
         time.sleep(1)  # Rafraîchir chaque seconde
 
     print("\nToutes les simulations sont terminées.")
@@ -138,14 +139,25 @@ if __name__ == "__main__":
         progress_display = Process(target=display_progress, args=(queue, num_simulations))
         progress_display.start()
         
-        # Lancer chaque simulation comme un processus séparé
+        # Lancer les simulations en limitant à `max_processes` simultanés
         processes = []
+        active_processes = 0
         for sim_num in range(1, num_simulations + 1):
             process = Process(target=run_simulation, args=(sim_num, queue, stop_flag))
             processes.append(process)
             process.start()
+            active_processes += 1
+            
+            # Limiter le nombre de processus simultanés à `max_processes`
+            if active_processes >= max_processes:
+                # Attendre que l'un des processus en cours se termine
+                for p in processes:
+                    p.join()
+                    active_processes -= 1  # Décrémenter quand un processus se termine
+                    processes.remove(p)  # Retirer le processus terminé de la liste
+                    break  # Sortir pour lancer le prochain processus dès qu'un slot est libre
         
-        # Attendre que tous les processus de simulation soient terminés
+        # Attendre la fin des processus restants
         for process in processes:
             process.join()
         
